@@ -3,7 +3,15 @@
   "scripts": {
     "build": "next build",
     "dev": "next dev --turbopack",
-    "start": "next start"
+    "start": "next start",
+    "db:start": "docker-compose up -d postgres",
+    "db:stop": "docker-compose down",
+    "db:restart": "docker-compose restart postgres",
+    "db:logs": "docker-compose logs -f postgres",
+    "db:reset": "docker-compose down -v && docker-compose up -d postgres",
+    "pgadmin:start": "docker-compose --profile admin up -d",
+    "pgadmin:stop": "docker-compose --profile admin down",
+    "seed": "curl http://localhost:3000/seed"
   },
   "dependencies": {
     "@heroicons/react": "^2.2.0",
@@ -11,7 +19,7 @@
     "autoprefixer": "10.4.20",
     "bcrypt": "^5.1.1",
     "clsx": "^2.1.1",
-    "next": "latest",
+    "next": "15.4.2-canary.21",
     "next-auth": "5.0.0-beta.25",
     "postcss": "8.5.1",
     "postgres": "^3.4.6",

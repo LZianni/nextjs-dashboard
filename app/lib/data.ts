@@ -9,8 +9,13 @@ import {
 } from './definitions';
 import { formatCurrency } from './utils';
 
-const sql = postgres(process.env.POSTGRES_URL!, { 
-  ssl: 'require',
+// Use DATABASE_URL first (local), then fallback to other URLs
+const databaseUrl = process.env.DATABASE_URL || 
+                   process.env.POSTGRES_URL_NON_POOLING || 
+                   process.env.POSTGRES_URL!;
+
+const sql = postgres(databaseUrl, { 
+  ssl: databaseUrl.includes('localhost') ? false : 'require', // Disable SSL for localhost
   connect_timeout: 30,
   idle_timeout: 30,
   max_lifetime: 60 * 30,
@@ -19,15 +24,13 @@ const sql = postgres(process.env.POSTGRES_URL!, {
 
 export async function fetchRevenue() {
   try {
-    // Artificially delay a response for demo purposes.
-    // Don't do this in production :)
 
-    // console.log('Fetching revenue data...');
-    // await new Promise((resolve) => setTimeout(resolve, 3000));
+    console.log('Fetching revenue data...');
+    await new Promise((resolve) => setTimeout(resolve, 3000));
 
     const data = await sql<Revenue[]>`SELECT * FROM revenue`;
 
-    // console.log('Data fetch completed after 3 seconds.');
+    console.log('Data fetch completed after 3 seconds.');
 
     return data;
   } catch (error) {

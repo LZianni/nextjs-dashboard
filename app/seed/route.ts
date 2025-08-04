@@ -2,20 +2,65 @@ import bcrypt from 'bcrypt';
 import postgres from 'postgres';
 import { invoices, customers, revenue, users } from '../lib/placeholder-data';
 
-// Use POSTGRES_URL_NON_POOLING for seeding operations to avoid timeouts
-const databaseUrl = process.env.POSTGRES_URL_NON_POOLING || process.env.POSTGRES_URL!;
+// Configure runtime for longer execution
+export const runtime = 'nodejs';
+export const maxDuration = 300; // 5 minutes
 
-// Create connection with retry logic
+// Use DATABASE_URL first (with channel binding), then fallback to other URLs
+const databaseUrl = process.env.DATABASE_URL || 
+                   process.env.POSTGRES_URL_NON_POOLING || 
+                   process.env.POSTGRES_URL!;
+
+// Create connection with optimized settings for seeding
 const createConnection = () => postgres(databaseUrl, { 
-  ssl: 'require',
-  connect_timeout: 60,
-  idle_timeout: 20,
-  max_lifetime: 60 * 10,
+  ssl: databaseUrl.includes('localhost') ? false : 'require', // Disable SSL for localhost
+  connect_timeout: 180, // 3 minutes
+  idle_timeout: 180,    // 3 minutes
+  max_lifetime: 60 * 30, // 30 minutes
   max: 1,
   transform: {
     undefined: null,
   },
 });
+
+// Helper function to wake up the database and establish connection
+async function wakeUpDatabase(maxRetries = 3) {
+  let sql: any;
+  let lastError: any;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`🔄 Tentativa de conexão ${attempt}/${maxRetries}...`);
+      
+      sql = createConnection();
+      
+      // Try to wake up the database with a simple query
+      await sql`SELECT 1 as test`;
+      console.log(`✅ Conexão estabelecida na tentativa ${attempt}`);
+      
+      return sql;
+    } catch (error) {
+      lastError = error;
+      console.log(`⚠️ Tentativa ${attempt} falhou:`, error instanceof Error ? error.message : 'Erro desconhecido');
+      
+      if (sql) {
+        try {
+          await sql.end();
+        } catch (closeError) {
+          // Ignore close errors
+        }
+      }
+      
+      if (attempt < maxRetries) {
+        const waitTime = attempt * 5000; // 5s, 10s, 15s
+        console.log(`⏳ Aguardando ${waitTime/1000}s antes da próxima tentativa...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+    }
+  }
+  
+  throw lastError;
+}
 
 async function seedUsers(sql: any) {
   await sql`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`;
@@ -28,16 +73,17 @@ async function seedUsers(sql: any) {
     );
   `;
 
-  const insertedUsers = await Promise.all(
-    users.map(async (user) => {
-      const hashedPassword = await bcrypt.hash(user.password, 10);
-      return sql`
-        INSERT INTO users (id, name, email, password)
-        VALUES (${user.id}, ${user.name}, ${user.email}, ${hashedPassword})
-        ON CONFLICT (id) DO NOTHING;
-      `;
-    }),
-  );
+  // Process users sequentially to avoid overwhelming the connection
+  const insertedUsers = [];
+  for (const user of users) {
+    const hashedPassword = await bcrypt.hash(user.password, 10);
+    const result = await sql`
+      INSERT INTO users (id, name, email, password)
+      VALUES (${user.id}, ${user.name}, ${user.email}, ${hashedPassword})
+      ON CONFLICT (id) DO NOTHING;
+    `;
+    insertedUsers.push(result);
+  }
 
   return insertedUsers;
 }
@@ -55,15 +101,23 @@ async function seedInvoices(sql: any) {
     );
   `;
 
-  const insertedInvoices = await Promise.all(
-    invoices.map(
-      (invoice) => sql`
-        INSERT INTO invoices (customer_id, amount, status, date)
-        VALUES (${invoice.customer_id}, ${invoice.amount}, ${invoice.status}, ${invoice.date})
-        ON CONFLICT (id) DO NOTHING;
-      `,
-    ),
-  );
+  // Process invoices in batches to improve performance
+  const batchSize = 10;
+  const insertedInvoices = [];
+  
+  for (let i = 0; i < invoices.length; i += batchSize) {
+    const batch = invoices.slice(i, i + batchSize);
+    const batchResults = await Promise.all(
+      batch.map(
+        (invoice) => sql`
+          INSERT INTO invoices (customer_id, amount, status, date)
+          VALUES (${invoice.customer_id}, ${invoice.amount}, ${invoice.status}, ${invoice.date})
+          ON CONFLICT (id) DO NOTHING;
+        `
+      )
+    );
+    insertedInvoices.push(...batchResults);
+  }
 
   return insertedInvoices;
 }
@@ -80,15 +134,23 @@ async function seedCustomers(sql: any) {
     );
   `;
 
-  const insertedCustomers = await Promise.all(
-    customers.map(
-      (customer) => sql`
-        INSERT INTO customers (id, name, email, image_url)
-        VALUES (${customer.id}, ${customer.name}, ${customer.email}, ${customer.image_url})
-        ON CONFLICT (id) DO NOTHING;
-      `,
-    ),
-  );
+  // Process customers in batches to improve performance
+  const batchSize = 10;
+  const insertedCustomers = [];
+  
+  for (let i = 0; i < customers.length; i += batchSize) {
+    const batch = customers.slice(i, i + batchSize);
+    const batchResults = await Promise.all(
+      batch.map(
+        (customer) => sql`
+          INSERT INTO customers (id, name, email, image_url)
+          VALUES (${customer.id}, ${customer.name}, ${customer.email}, ${customer.image_url})
+          ON CONFLICT (id) DO NOTHING;
+        `
+      )
+    );
+    insertedCustomers.push(...batchResults);
+  }
 
   return insertedCustomers;
 }
@@ -119,41 +181,78 @@ export async function GET() {
   
   try {
     console.log('🌱 Iniciando seed do banco de dados...');
+    console.log('📊 Configurações:', {
+      url_type: process.env.POSTGRES_URL_NON_POOLING ? 'NON_POOLING' : 'POOLED',
+      max_duration: '300s',
+      runtime: 'nodejs'
+    });
     
-    // Create fresh connection
-    sql = createConnection();
+    // Wake up the database first (Neon databases can hibernate)
+    console.log('� Acordando banco de dados (Neon pode estar hibernando)...');
+    sql = await wakeUpDatabase();
     
-    // Test connection first
-    await sql`SELECT 1`;
-    console.log('✅ Conexão com banco estabelecida');
-    
+    // Run seeding operations within a transaction
+    console.log('🔒 Iniciando transação para seed...');
     const result = await sql.begin(async (sqlTx: any) => {
       console.log('👤 Seeding users...');
       await seedUsers(sqlTx);
+      console.log('✅ Users seeded successfully');
       
       console.log('🏢 Seeding customers...');
       await seedCustomers(sqlTx);
+      console.log('✅ Customers seeded successfully');
       
       console.log('📄 Seeding invoices...');
       await seedInvoices(sqlTx);
+      console.log('✅ Invoices seeded successfully');
       
       console.log('💰 Seeding revenue...');
       await seedRevenue(sqlTx);
+      console.log('✅ Revenue seeded successfully');
       
       return 'Database seeded successfully';
     });
 
     console.log('🎉 Seed concluído com sucesso!');
-    return Response.json({ message: 'Database seeded successfully' });
+    return Response.json({ 
+      message: 'Database seeded successfully',
+      timestamp: new Date().toISOString(),
+      details: {
+        users: users.length,
+        customers: customers.length,
+        invoices: invoices.length,
+        revenue_records: revenue.length
+      }
+    });
   } catch (error) {
     console.error('❌ Erro durante o seed:', error);
+    
+    // Provide more detailed error information
+    const errorDetails = {
+      message: error instanceof Error ? error.message : 'Unknown error occurred',
+      name: error instanceof Error ? error.name : 'UnknownError',
+      code: (error as any)?.code || 'UNKNOWN_CODE',
+      timestamp: new Date().toISOString()
+    };
+    
     return Response.json({ 
-      error: error instanceof Error ? error.message : 'Unknown error occurred',
-      details: error 
+      error: 'Failed to seed database',
+      details: errorDetails,
+      suggestions: [
+        'Database might be hibernating (Neon free tier)',
+        'Try again in a few moments',
+        'Check your connection string',
+        'Verify database is accessible'
+      ]
     }, { status: 500 });
   } finally {
     if (sql) {
-      await sql.end();
+      try {
+        await sql.end();
+        console.log('🔌 Conexão com banco fechada');
+      } catch (closeError) {
+        console.error('⚠️ Erro ao fechar conexão:', closeError);
+      }
     }
   }
 }
